@@ -56,8 +56,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public final class RedisChat extends JavaPlugin {
+    private static final AtomicInteger EXECUTOR_THREAD_INDEX = new AtomicInteger();
 
     @Getter
     private static RedisChat instance;
@@ -109,7 +112,7 @@ public final class RedisChat extends JavaPlugin {
             getLogger().severe("config.yml or messages.yml or guis.yml is invalid! Please regenerate them (starting from config.yml: " + e.getMessage());
         }
 
-        this.executorService = Executors.newFixedThreadPool(config.chatThreads);
+        this.executorService = createExecutorService(config.chatThreads);
 
         //Redis section
         this.dataManager = switch (config.getDataType()) {
@@ -346,19 +349,69 @@ public final class RedisChat extends JavaPlugin {
     @Override
     public void onDisable() {
         getLogger().warning("RedisChat is disabling...");
-        if (this.dataManager != null)
-            this.dataManager.clearInvShareCache();
-
-        PaperUniform.getInstance(this).shutdown();
+        safeShutdownStep("clearing invshare cache", () -> {
+            if (this.dataManager != null)
+                this.dataManager.clearInvShareCache();
+        });
+        safeShutdownStep("stopping PaperUniform", () -> PaperUniform.getInstance(this).shutdown());
         // Commands are unregistered automatically by CommandAPI plugin
-        registeredCommands.clear();
+        safeShutdownStep("clearing registered commands", () -> {
+            if (registeredCommands != null) {
+                registeredCommands.clear();
+            }
+        });
+        safeShutdownStep("stopping player list task", () -> {
+            if (this.playerListManager != null)
+                this.playerListManager.stop();
+        });
+        safeShutdownStep("stopping announcer tasks", () -> {
+            if (this.announcerManager != null)
+                this.announcerManager.cancelAll();
+        });
+        safeShutdownStep("shutting down async executor", this::shutdownExecutorService);
+        safeShutdownStep("closing data manager", () -> {
+            if (this.dataManager != null)
+                this.dataManager.close();
+        });
+    }
 
-        if (this.playerListManager != null)
-            this.playerListManager.stop();
-        if (this.dataManager != null)
-            this.dataManager.close();
-        if (this.announcerManager != null)
-            this.announcerManager.cancelAll();
+    private ExecutorService createExecutorService(int threadCount) {
+        final int poolSize = Math.max(1, threadCount);
+        return Executors.newFixedThreadPool(poolSize, runnable -> {
+            final Thread thread = new Thread(runnable, "RedisChat-Async-" + EXECUTOR_THREAD_INDEX.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
+        });
+    }
+
+    private void shutdownExecutorService() {
+        if (this.executorService == null || this.executorService.isShutdown()) {
+            return;
+        }
+
+        this.executorService.shutdown();
+        try {
+            if (!this.executorService.awaitTermination(5, TimeUnit.SECONDS)) {
+                getLogger().warning("Executor did not terminate in time, forcing shutdown now.");
+                this.executorService.shutdownNow();
+                if (!this.executorService.awaitTermination(5, TimeUnit.SECONDS)) {
+                    getLogger().warning("Executor still running after forced shutdown.");
+                }
+            }
+        } catch (InterruptedException e) {
+            getLogger().warning("Interrupted while waiting for executor shutdown, forcing shutdown now.");
+            this.executorService.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void safeShutdownStep(@NotNull String stepName, @NotNull Runnable step) {
+        try {
+            step.run();
+        } catch (Throwable throwable) {
+            getLogger().severe("Error while " + stepName + ": " + throwable.getMessage());
+            throwable.printStackTrace();
+        }
     }
 
     private void loadCommand(@NotNull String cmdName, @NotNull CommandExecutor executor, @Nullable TabCompleter tabCompleter) {

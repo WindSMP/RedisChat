@@ -35,16 +35,21 @@ import java.util.concurrent.ConcurrentHashMap;
 
 public class ChannelManager extends RedisChatAPI {
 
+    private static final long MESSAGE_DEDUP_TTL_MS = 5_000L;
+    private static final int MESSAGE_DEDUP_MAX_ENTRIES = 8_192;
+
     private final RedisChat plugin;
     @Getter
     private final ConcurrentHashMap<String, Channel> registeredChannels;
     private final ConcurrentHashMap<String, String> activePlayerChannels;
+    private final ConcurrentHashMap<String, Long> recentMessageFingerprintCache;
     @Getter
     private final MuteManager muteManager;
     @Getter
     private final FilterManager filterManager;
     @Getter
     private final ChannelGUI channelGUI;
+    private volatile long lastMessageFingerprintCleanup = 0L;
     private static final MiniMessage miniMessage = MiniMessage.miniMessage();
 
 
@@ -53,6 +58,7 @@ public class ChannelManager extends RedisChatAPI {
         this.plugin = plugin;
         this.registeredChannels = new ConcurrentHashMap<>();
         this.activePlayerChannels = new ConcurrentHashMap<>();
+        this.recentMessageFingerprintCache = new ConcurrentHashMap<>();
         this.muteManager = new MuteManager(plugin);
         this.filterManager = new FilterManager(plugin);
         this.channelGUI = new ChannelGUI(plugin);
@@ -369,6 +375,12 @@ public class ChannelManager extends RedisChatAPI {
 
     @Override
     public void sendGenericChat(@NotNull ChatMessage chatMessage) {
+        if (isDuplicateMessage(chatMessage)) {
+            if (plugin.config.debug) {
+                plugin.getLogger().info("Skipped duplicate message fingerprint " + buildMessageFingerprint(chatMessage));
+            }
+            return;
+        }
 
         Set<Player> recipients;
         if (chatMessage.getReceiver().isPlayer()) {
@@ -437,6 +449,46 @@ public class ChannelManager extends RedisChatAPI {
                     .forEach(player -> plugin.getComponentProvider().sendComponentOrCache(player, spyComponent));
         }
 
+    }
+
+    private boolean isDuplicateMessage(@NotNull ChatMessage chatMessage) {
+        final long now = System.currentTimeMillis();
+        cleanupRecentMessageFingerprints(now);
+        final String fingerprint = buildMessageFingerprint(chatMessage);
+        final Long previousSeen = recentMessageFingerprintCache.put(fingerprint, now);
+        return previousSeen != null && (now - previousSeen) <= MESSAGE_DEDUP_TTL_MS;
+    }
+
+    private String buildMessageFingerprint(@NotNull ChatMessage chatMessage) {
+        return chatMessage.getTimestamp() + "|" +
+                chatMessage.getSender().getType() + "|" +
+                chatMessage.getSender().getName() + "|" +
+                chatMessage.getReceiver().getType() + "|" +
+                chatMessage.getReceiver().getName() + "|" +
+                chatMessage.getFormat().hashCode() + "|" +
+                chatMessage.getContent().hashCode();
+    }
+
+    private void cleanupRecentMessageFingerprints(long now) {
+        if (now - lastMessageFingerprintCleanup < 1_000L) {
+            return;
+        }
+        lastMessageFingerprintCleanup = now;
+
+        recentMessageFingerprintCache.entrySet()
+                .removeIf(entry -> now - entry.getValue() > MESSAGE_DEDUP_TTL_MS);
+
+        int overflow = recentMessageFingerprintCache.size() - MESSAGE_DEDUP_MAX_ENTRIES;
+        if (overflow <= 0) {
+            return;
+        }
+
+        Iterator<String> iterator = recentMessageFingerprintCache.keySet().iterator();
+        while (overflow > 0 && iterator.hasNext()) {
+            iterator.next();
+            iterator.remove();
+            overflow--;
+        }
     }
 
     private void playConfiguredSound(@NotNull Player recipient, @NotNull String soundConfig) {
